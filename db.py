@@ -111,13 +111,22 @@ def upsert_proposal(
             logger.debug("Skipping already-decided proposal %s (%s)", pid, row["decision"])
             return None
 
-        # Insert or ignore (re-runs regenerate the same id; we keep the original)
+        # Re-runs regenerate the same id. A still-pending proposal is refreshed
+        # with today's data (keeping its original created_at); decided ones
+        # returned above and are never touched.
         con.execute(
             """
-            INSERT OR IGNORE INTO proposals
+            INSERT INTO proposals
                 (id, match_type, scraped_json, crm_json,
                  issues_json, proposed_changes_json, evidence_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                match_type = excluded.match_type,
+                scraped_json = excluded.scraped_json,
+                crm_json = excluded.crm_json,
+                issues_json = excluded.issues_json,
+                proposed_changes_json = excluded.proposed_changes_json,
+                evidence_json = excluded.evidence_json
             """,
             (
                 pid,
@@ -131,6 +140,26 @@ def upsert_proposal(
             ),
         )
     return pid
+
+
+def location_reviewed(scraped_name: str, db_path: Path = DB_PATH) -> bool:
+    """Has a reviewer already decided some proposal for this website location?
+
+    Approving a fix changes the CRM, so the next run sees a *different* match
+    (e.g. a CHOW or new account has a new id) and a different proposal id. A
+    confident match for an already-reviewed location is therefore not news.
+    """
+    with _conn(db_path) as con:
+        row = con.execute(
+            """
+            SELECT 1 FROM proposals p
+            JOIN decisions d ON d.proposal_id = p.id
+            WHERE json_extract(p.scraped_json, '$.name') = ?
+            LIMIT 1
+            """,
+            (scraped_name,),
+        ).fetchone()
+    return row is not None
 
 
 def get_pending_proposals(db_path: Path = DB_PATH) -> list[dict]:

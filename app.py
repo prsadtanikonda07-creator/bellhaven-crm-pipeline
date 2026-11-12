@@ -55,7 +55,7 @@ def _bellhaven_parent_id():
     return parent.get("id") if parent else None
 
 
-def _account_payload(scraped: dict, fallback: dict) -> dict:
+def _account_payload(scraped: dict, fallback: dict, note: str = "") -> dict:
     """Build a new account in the CRM's own field names (billing_*), preferring
     the website's values and falling back to the existing CRM record."""
     def pick(scraped_key, crm_key):
@@ -70,6 +70,7 @@ def _account_payload(scraped: dict, fallback: dict) -> dict:
         "phone": pick("phone", "phone"),
         "care_type": ", ".join(scraped.get("care_types") or []) or fallback.get("care_type", ""),
         "status": "Active",
+        "note": note,
     }
 
 
@@ -122,7 +123,10 @@ def _perform_crm_write(proposal: dict) -> dict:
 
     # ---- 2. New account — create it --------------------------------
     if match_type == NEW_ACCOUNT:
-        new_data = _account_payload(scraped, {})
+        new_data = _account_payload(
+            scraped, {},
+            note=f"Created from the Bellhaven website listing {scraped.get('source_url', '')}".strip(),
+        )
         parent_id = (proposal.get("evidence_json") or {}).get("bellhaven_parent_id") or _bellhaven_parent_id()
         if parent_id:
             new_data["parent_id"] = parent_id
@@ -138,7 +142,11 @@ def _perform_crm_write(proposal: dict) -> dict:
     if match_type in ("NEEDS_FIX_NAME", "NEEDS_FIX_PARENT", "NEEDS_FIX_BOTH"):
         if is_chow:
             # CHOW path: preserve old account, create new, link with chow_current_account
-            new_data = _account_payload(scraped, crm_account)
+            # The old account is left exactly as it is (SOP); only the new one carries a note.
+            new_data = _account_payload(
+                scraped, crm_account,
+                note=f"Change of ownership: replaces {crm_id}, which is kept unchanged for its billing history.",
+            )
             parent_id = changes.get("parent_id")
             if parent_id:
                 new_data["parent_id"] = parent_id

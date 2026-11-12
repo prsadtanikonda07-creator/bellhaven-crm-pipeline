@@ -17,6 +17,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Optional
 
 from rapidfuzz import fuzz, process
@@ -194,6 +195,16 @@ def _crm_parent(acc: dict) -> Optional[str]:
     return acc.get("parent_id") or acc.get("parent_account_id")
 
 
+def is_superseded(acc: dict) -> bool:
+    """Already resolved by a past decision: a duplicate pointing at its survivor,
+    or an old account preserved for billing after a change of ownership."""
+    return bool(acc.get("duplicate_of_account") or acc.get("chow_current_account"))
+
+
+def is_parent_account(acc: dict) -> bool:
+    return "(parent account)" in _crm_name(acc).lower()
+
+
 # ------------------------------------------------------------------ #
 # Core matcher
 # ------------------------------------------------------------------ #
@@ -268,7 +279,7 @@ class Matcher:
         # is never enough: "Bellhaven of Kettering" is not "Bellhaven of Marion".
         candidates: list[tuple[tuple, dict]] = []
         for acc in self.all_accounts:
-            if "(parent account)" in _crm_name(acc).lower():
+            if is_parent_account(acc) or is_superseded(acc):
                 continue
             same_place = _zip_match(zip_code, _crm_zip(acc)) or (
                 city and city.casefold() == (acc.get("billing_city") or acc.get("city") or "").casefold()
@@ -395,7 +406,7 @@ class Matcher:
             acc_id = acc.get("id")
             if acc_id in matched_crm_ids:
                 continue
-            if acc.get("id") == self.bellhaven_parent_id:
+            if acc.get("id") == self.bellhaven_parent_id or is_superseded(acc):
                 continue
 
             orphans.append(MatchResult(
@@ -406,7 +417,14 @@ class Matcher:
                     "Account exists under Bellhaven in CRM but not found on website. "
                     "May be closed, sold, or renamed. Consider marking Inactive or Needs Review."
                 ],
-                proposed_changes={"status": "Needs Review"},
+                proposed_changes={
+                    "status": "Needs Review",
+                    "note": (
+                        f"Listed under Bellhaven Senior Living but not on the Bellhaven website "
+                        f"as of {date.today().isoformat()}. May be closed, sold, or renamed; "
+                        f"confirm ownership before changing the parent."
+                    ),
+                },
                 evidence={
                     "crm_name": _crm_name(acc),
                     "crm_address": _full_crm_address(acc),

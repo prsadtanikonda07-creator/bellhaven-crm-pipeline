@@ -21,7 +21,12 @@ from typing import Optional
 
 from crm_client import CRMClient
 from scraper import scrape_bellhaven
-from matcher import Matcher, NEW_ACCOUNT, CONFIDENT_MATCH, NEEDS_FIX_PARENT, NEEDS_FIX_BOTH
+from datetime import date
+
+from matcher import (
+    Matcher, MatchResult, NEW_ACCOUNT, CONFIDENT_MATCH, NEEDS_FIX_PARENT, NEEDS_FIX_BOTH, ORPHANED,
+    _crm_name, _crm_parent, _same_street, _zip_match, is_parent_account, is_superseded,
+)
 from chow import chow_required, describe_chow
 import db as database
 
@@ -97,6 +102,7 @@ def run(site: str = "https://analyst-assessment-production.up.railway.app",
         "chow_cases": 0,
     }
 
+    matches: list[tuple[dict, dict]] = []   # (scraped location, matched CRM account)
     for loc in scraped_locations:
         loc_dict = loc.to_dict()
         result = matcher.match_location(loc_dict)
@@ -104,6 +110,14 @@ def run(site: str = "https://analyst-assessment-production.up.railway.app",
         # Track matched CRM ids (to identify orphans later)
         if result.crm_account:
             matched_crm_ids.add(result.crm_account.get("id", ""))
+            matches.append((loc_dict, result.crm_account))
+
+        # Nothing to change at a location a reviewer already decided on: after
+        # an approved CHOW or new account it matches a different id, which must
+        # not come back as a fresh proposal.
+        if result.match_type == CONFIDENT_MATCH and database.location_reviewed(loc_dict["name"], db_path):
+            summary["skipped_already_decided"] += 1
+            continue
 
         # Apply CHOW logic to reparenting proposals
         chow_note = ""
@@ -147,6 +161,7 @@ def run(site: str = "https://analyst-assessment-production.up.railway.app",
     # ------------------------------------------------------------------ #
     logger.info("=== STEP 5: Detecting duplicate accounts ===")
     duplicate_ids = _detect_duplicates(all_accounts, bellhaven_parent_id, proposal_ids, summary, db_path)
+    duplicate_ids |= _detect_stale_same_address(all_accounts, matches, duplicate_ids, proposal_ids, summary, db_path)
     # A duplicate already has its own proposal; don't also call it orphaned.
     matched_crm_ids |= duplicate_ids
 
@@ -155,6 +170,7 @@ def run(site: str = "https://analyst-assessment-production.up.railway.app",
     # ------------------------------------------------------------------ #
     logger.info("=== STEP 7: Finding orphaned accounts ===")
     orphans = matcher.find_orphaned_accounts(matched_crm_ids)
+    orphans += _find_unparented_bellhaven(all_accounts, matched_crm_ids, bellhaven_parent_id)
     logger.info("Found %d orphaned accounts", len(orphans))
 
     for result in orphans:
@@ -212,7 +228,7 @@ def _detect_duplicates(
     # Group Bellhaven accounts by normalised (name, city) key
     groups: dict = defaultdict(list)
     for acc in all_accounts:
-        if _crm_parent(acc) != bellhaven_parent_id:
+        if _crm_parent(acc) != bellhaven_parent_id or is_superseded(acc):
             continue
         name_key = _crm_name(acc).lower().strip()
         city_key = (acc.get("billing_city") or acc.get("city") or "").lower().strip()
@@ -241,6 +257,10 @@ def _detect_duplicates(
             proposed = {
                 "duplicate_of_account": survivor.get("id"),
                 "status": "Inactive",
+                "note": (
+                    f"Duplicate of {_crm_name(survivor)} ({survivor.get('id')}): same name and city "
+                    f"under Bellhaven. Marked by the Bellhaven sync pipeline {date.today().isoformat()}."
+                ),
             }
             pid = database.upsert_proposal(
                 match_type="DUPLICATE",
@@ -265,6 +285,121 @@ def _detect_duplicates(
                     _crm_name(loser), loser.get("id"), survivor.get("id"),
                 )
     return duplicate_ids
+
+
+def _detect_stale_same_address(
+    all_accounts: list[dict],
+    matches: list[tuple[dict, dict]],
+    already_proposed: set[str],
+    proposal_ids: list[str],
+    summary: dict,
+    db_path,
+) -> set[str]:
+    """
+    Other CRM accounts at the exact street + ZIP of a matched Bellhaven location
+    are left over from a previous operator (e.g. "Harborview Shores of Erie" at
+    Bellhaven Shores of Erie's address). One building, one facility: propose
+    marking each a duplicate of the matched account. If the stale record has
+    billing history (revenue AND outstanding AR), don't deactivate it; flag it
+    Needs Review for the billing team instead, mirroring the CHOW SOP.
+    """
+    summary.setdefault("duplicates", 0)
+    flagged: set[str] = set()
+    for loc, survivor in matches:
+        for acc in all_accounts:
+            acc_id = acc.get("id", "")
+            if (
+                acc_id == survivor.get("id")
+                or acc_id in already_proposed or acc_id in flagged
+                or is_parent_account(acc) or is_superseded(acc)
+                or not _zip_match(loc.get("zip_code", ""), acc.get("billing_zip", ""))
+                or not _same_street(loc.get("address", ""), acc.get("billing_street", ""))
+            ):
+                continue
+            flagged.add(acc_id)
+            billing = (acc.get("lifetime_revenue") or 0) > 0 and (acc.get("outstanding_ar") or 0) > 0
+            where = f"{loc['address']}, {loc['city']} {loc['state']}"
+            if billing:
+                proposed = {
+                    "status": "Needs Review",
+                    "note": (
+                        f"Same address as {loc['name']} ({survivor.get('id')}), {where}, but has billing "
+                        f"history, so not deactivated. Billing team to confirm before marking duplicate."
+                    ),
+                }
+            else:
+                proposed = {
+                    "duplicate_of_account": survivor.get("id"),
+                    "status": "Inactive",
+                    "note": (
+                        f"Stale record from a previous operator: same address as {loc['name']} "
+                        f"({survivor.get('id')}), {where}. Marked by the Bellhaven sync pipeline "
+                        f"{date.today().isoformat()}."
+                    ),
+                }
+            issues = [
+                f"Same street address and ZIP as '{loc['name']}' ({where}), which is matched to "
+                f"'{_crm_name(survivor)}' ({survivor.get('id')}). Current parent: "
+                f"{acc.get('parent_name') or 'none'}."
+            ]
+            pid = database.upsert_proposal(
+                match_type="DUPLICATE",
+                scraped=None,
+                crm_account=acc,
+                issues=issues,
+                proposed_changes=proposed,
+                evidence={
+                    "crm_name": _crm_name(acc),
+                    "crm_account_id": acc_id,
+                    "survivor_id": survivor.get("id"),
+                    "survivor_name": _crm_name(survivor),
+                    "shared_address": where,
+                },
+                db_path=db_path,
+            )
+            if pid:
+                proposal_ids.append(pid)
+                summary["duplicates"] += 1
+                logger.info("Stale record: '%s' (%s) shares the address of '%s'",
+                            _crm_name(acc), acc_id, loc["name"])
+    return flagged
+
+
+def _find_unparented_bellhaven(
+    all_accounts: list[dict], matched_ids: set[str], bellhaven_parent_id: Optional[str]
+) -> list[MatchResult]:
+    """Bellhaven-branded accounts with no parent at all that match no website
+    location. Not ours to re-parent on absence of evidence, but worth a flag."""
+    found = []
+    for acc in all_accounts:
+        if (
+            "bellhaven" not in _crm_name(acc).lower()
+            or is_parent_account(acc) or is_superseded(acc)
+            or _crm_parent(acc) or acc.get("id") in matched_ids
+        ):
+            continue
+        found.append(MatchResult(
+            match_type=ORPHANED,
+            crm_account=acc,
+            bellhaven_parent_id=bellhaven_parent_id,
+            issues=[
+                "Bellhaven-branded account with no parent, and not listed on the Bellhaven website. "
+                "Not re-parented without evidence it is a current Bellhaven community."
+            ],
+            proposed_changes={
+                "status": "Needs Review",
+                "note": (
+                    f"Bellhaven-branded but has no parent account and is not on the Bellhaven website "
+                    f"as of {date.today().isoformat()}. Confirm current owner before assigning a parent."
+                ),
+            },
+            evidence={
+                "crm_name": _crm_name(acc),
+                "crm_status": acc.get("status", ""),
+                "crm_account_id": acc.get("id"),
+            },
+        ))
+    return found
 
 
 if __name__ == "__main__":
