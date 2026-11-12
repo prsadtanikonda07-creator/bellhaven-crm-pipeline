@@ -467,8 +467,11 @@ def proposal_detail(pid):
         + kv("Address", scraped.get("address", ""), crm_acc.get("address", "") or crm_acc.get("billing_street", ""))
         + kv("City", scraped.get("city", ""), crm_acc.get("city", "") or crm_acc.get("billing_city", ""))
         + kv("State", scraped.get("state", ""), crm_acc.get("state", "") or crm_acc.get("billing_state", ""))
-        + kv("ZIP", scraped.get("zip_code", ""), crm_acc.get("zip", "") or crm_acc.get("zip_code", ""))
-        + kv("Parent ID", evidence.get("bellhaven_parent_id", ""), crm_acc.get("parent_id", ""))
+        + kv("ZIP", scraped.get("zip_code", ""), crm_acc.get("zip", "") or crm_acc.get("zip_code", "") or crm_acc.get("billing_zip", ""))
+        # A location listed on the Bellhaven website belongs under the Bellhaven parent.
+        + kv("Parent",
+             "Bellhaven Senior Living (Parent Account)" if scraped else "",
+             crm_acc.get("parent_name", "") or ("none" if crm_acc else ""))
         + kv("Status", "Active (on website)", crm_acc.get("status", ""))
     )
 
