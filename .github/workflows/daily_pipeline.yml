@@ -1,0 +1,72 @@
+name: Bellhaven Daily CRM Pipeline
+
+on:
+  schedule:
+    # 7:00 AM ET every day (12:00 UTC).
+    # Runs before the sales team starts their day so the review queue is fresh.
+    - cron: "0 12 * * *"
+
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      CRM_TOKEN: ${{ secrets.CRM_TOKEN }}
+      SITE_URL:  ${{ vars.SITE_URL || 'https://analyst-assessment-production.up.railway.app' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore the SQLite database that holds past decisions so re-runs
+      # never re-propose already-decided items.
+      - name: Restore decisions database
+        uses: actions/cache@v4
+        with:
+          path: pipeline.db
+          key: pipeline-db-${{ github.ref_name }}
+          restore-keys: pipeline-db-
+
+      - name: Run pipeline
+        run: python pipeline.py
+
+      # Persist the updated database (new proposals added this run).
+      # The cache key is intentionally stable so each run saves over the last.
+      - name: Save decisions database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: pipeline.db
+          key: pipeline-db-${{ github.ref_name }}
+
+      # Optional: export pending proposals as a JSON artifact so reviewers
+      # can inspect the queue without running the app locally.
+      - name: Export pending proposals
+        run: |
+          python - <<'EOF'
+          import json, db as database
+          pending = database.get_pending_proposals()
+          with open("pending_proposals.json", "w") as f:
+              json.dump(pending, f, indent=2, default=str)
+          print(f"Exported {len(pending)} pending proposals")
+          EOF
+
+      - name: Upload pending proposals artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pending-proposals-${{ github.run_id }}
+          path: pending_proposals.json
+          retention-days: 7
