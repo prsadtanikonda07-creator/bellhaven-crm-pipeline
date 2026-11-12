@@ -131,7 +131,9 @@ def _apply_field(loc: ScrapedLocation, label: str, value: str):
             elif part and not loc.address:
                 loc.address = part
     elif "care" in label:
-        loc.care_types = [v.strip() for v in re.split(r"[,&]", value) if v.strip()]
+        # One badge per offering (one line each); "&" is part of a name
+        # like "Short-Term Rehabilitation & Nursing", not a separator.
+        loc.care_types = [v.strip() for v in re.split(r"[,\n]", value) if v.strip()]
     elif "administrator" in label or "admin" in label:
         loc.administrator = value
     elif "phone" in label or "tel" in label:

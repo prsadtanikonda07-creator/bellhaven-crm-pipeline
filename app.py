@@ -24,22 +24,53 @@ The app handles three write paths automatically:
    → POST new account
 5. ORPHANED
    → PATCH status = "Needs Review" (or whatever reviewer specifies)
+6. DUPLICATE
+   → PATCH duplicate_of_account = survivor id, status = "Inactive"
 """
 
 import json
 import logging
+import os
+from functools import lru_cache
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 import db as database
 from crm_client import CRMClient
-from matcher import CONFIDENT_MATCH, NEW_ACCOUNT, ORPHANED
+from matcher import CONFIDENT_MATCH, NEW_ACCOUNT, ORPHANED, Matcher
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# flash() messages live in the session, which Flask refuses to use without a key.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 crm = CRMClient()
+
+
+@lru_cache(maxsize=1)
+def _bellhaven_parent_id():
+    """Proposals don't all carry the parent id, so resolve it once from the CRM."""
+    parent = Matcher(crm.get_all_accounts()).find_bellhaven_parent()
+    return parent.get("id") if parent else None
+
+
+def _account_payload(scraped: dict, fallback: dict) -> dict:
+    """Build a new account in the CRM's own field names (billing_*), preferring
+    the website's values and falling back to the existing CRM record."""
+    def pick(scraped_key, crm_key):
+        return scraped.get(scraped_key) or fallback.get(crm_key, "")
+
+    return {
+        "name": pick("name", "name"),
+        "billing_street": pick("address", "billing_street"),
+        "billing_city": pick("city", "billing_city"),
+        "billing_state": pick("state", "billing_state"),
+        "billing_zip": pick("zip_code", "billing_zip"),
+        "phone": pick("phone", "phone"),
+        "care_type": ", ".join(scraped.get("care_types") or []) or fallback.get("care_type", ""),
+        "status": "Active",
+    }
 
 
 # ------------------------------------------------------------------ #
@@ -91,16 +122,8 @@ def _perform_crm_write(proposal: dict) -> dict:
 
     # ---- 2. New account — create it --------------------------------
     if match_type == NEW_ACCOUNT:
-        new_data = {
-            "name": scraped.get("name", ""),
-            "address": scraped.get("address", ""),
-            "city": scraped.get("city", ""),
-            "state": scraped.get("state", ""),
-            "zip": scraped.get("zip_code", ""),
-            "status": "Active",
-        }
-        # Look up parent id from evidence if stored there
-        parent_id = (proposal.get("evidence_json") or {}).get("bellhaven_parent_id")
+        new_data = _account_payload(scraped, {})
+        parent_id = (proposal.get("evidence_json") or {}).get("bellhaven_parent_id") or _bellhaven_parent_id()
         if parent_id:
             new_data["parent_id"] = parent_id
         try:
@@ -115,14 +138,7 @@ def _perform_crm_write(proposal: dict) -> dict:
     if match_type in ("NEEDS_FIX_NAME", "NEEDS_FIX_PARENT", "NEEDS_FIX_BOTH"):
         if is_chow:
             # CHOW path: preserve old account, create new, link with chow_current_account
-            new_data = {
-                "name": scraped.get("name", crm_account.get("name", "")),
-                "address": scraped.get("address", crm_account.get("address", "")),
-                "city": scraped.get("city", crm_account.get("city", "")),
-                "state": scraped.get("state", crm_account.get("state", "")),
-                "zip": scraped.get("zip_code", crm_account.get("zip", "")),
-                "status": "Active",
-            }
+            new_data = _account_payload(scraped, crm_account)
             parent_id = changes.get("parent_id")
             if parent_id:
                 new_data["parent_id"] = parent_id
@@ -164,6 +180,15 @@ def _perform_crm_write(proposal: dict) -> dict:
             )
         except Exception as e:
             result["errors"].append(f"Orphan update failed: {e}")
+        return result
+
+    # ---- 5. Duplicate — point at the survivor and deactivate ------
+    if match_type == "DUPLICATE":
+        try:
+            crm.update_account(crm_id, changes)
+            result["actions"].append(f"Duplicate: Updated account {crm_id}: {list(changes.keys())}")
+        except Exception as e:
+            result["errors"].append(f"Duplicate update failed: {e}")
         return result
 
     result["actions"].append(f"Unknown match type {match_type!r} — no write performed")
