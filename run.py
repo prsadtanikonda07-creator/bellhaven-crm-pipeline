@@ -13,6 +13,13 @@ import argparse
 import logging
 import sys
 
+# Windows consoles default to cp1252, which can't print the emoji/dashes below.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",

@@ -240,6 +240,44 @@ def _collect_community_links(session: requests.Session) -> list[str]:
     return links
 
 
+_DETAIL_PATH_RE = re.compile(r"^/communities/[^/?#]+/?$")
+
+
+def _collect_featured_links(session: requests.Session, known: list[str]) -> list[str]:
+    """
+    Community pages linked from the homepage (and the site pages it links to)
+    but missing from the paginated directory, e.g. a "New this year" notice
+    announcing a newly acquired community before it is added to the directory.
+    """
+    found: list[str] = []
+    home = f"{BASE_SITE}/"
+    pages = [home]
+    home_soup = _get(home, session)
+    if not home_soup:
+        logger.warning("Could not fetch homepage; skipping featured-community check")
+        return found
+
+    # Other top-level site pages linked from the homepage (e.g. /about)
+    for a in home_soup.find_all("a", href=True):
+        path = urljoin(BASE_SITE, a["href"]).replace(BASE_SITE, "", 1)
+        if path.startswith("/") and path not in ("/", COMMUNITIES_PATH) \
+                and not path.startswith(COMMUNITIES_PATH):
+            pages.append(urljoin(BASE_SITE, path))
+
+    for page_url in dict.fromkeys(pages):
+        soup = home_soup if page_url == home else _get(page_url, session)
+        if not soup:
+            continue
+        for a in soup.find_all("a", href=True):
+            full_url = urljoin(BASE_SITE, a["href"])
+            path = full_url.replace(BASE_SITE, "", 1)
+            if _DETAIL_PATH_RE.match(path) and full_url not in known and full_url not in found:
+                logger.info("Found community linked outside the directory: %s (on %s)",
+                            full_url, page_url)
+                found.append(full_url)
+    return found
+
+
 def scrape_bellhaven(site: str = BASE_SITE) -> list[ScrapedLocation]:
     """
     Scrape all Bellhaven communities. Returns a list of ScrapedLocation objects.
@@ -248,6 +286,7 @@ def scrape_bellhaven(site: str = BASE_SITE) -> list[ScrapedLocation]:
     session.headers["User-Agent"] = "BellhavenPipeline/1.0 (assessment)"
 
     community_urls = _collect_community_links(session)
+    community_urls += _collect_featured_links(session, community_urls)
     logger.info("Found %d community pages to scrape", len(community_urls))
 
     locations = []

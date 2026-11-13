@@ -26,7 +26,8 @@ The pipeline runs first (~1-2 min), then the review app starts automatically.
 ## What the pipeline does
 
 1. **Scrapes** every Bellhaven community from `https://analyst-assessment-production.up.railway.app`  
-   Extracts: name, address, city, state, zip, care offerings.
+   Extracts: name, address, city, state, zip, care offerings.  
+   Also follows community links on the homepage and other site pages, so a community announced there (e.g. a "New this year" notice) is picked up before it is added to the paginated directory.
 
 2. **Fetches** all accounts from the CRM sandbox API.
 
